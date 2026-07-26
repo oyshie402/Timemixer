@@ -238,8 +238,3 @@ if __name__ == "__main__":
 
     summarize("TimeMixer", tm_results)
     summarize("DLinear", dl_results)
-
-            print(f"Average  MSE={sum(mses)/len(mses):.4f}  MAE={sum(maes)/len(maes):.4f}")
-
-    summarize("TimeMixer", tm_results)
-    summarize("DLinear", dl_results)
