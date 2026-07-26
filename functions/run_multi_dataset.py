@@ -1,13 +1,3 @@
-"""
-Generalized data loader + multi-dataset runner for TimeMixer / DLinear.
-
-
-Usage:
-    python run_multi_dataset.py --dataset weather --csv_path weather.csv
-    python run_multi_dataset.py --dataset electricity --csv_path electricity.csv
-    python run_multi_dataset.py --dataset etth1 --csv_path ETTh1.csv
-"""
-
 import argparse
 import numpy as np
 import pandas as pd
@@ -17,8 +7,8 @@ from torch.utils.data import Dataset, DataLoader
 
 from timemixer import (
     Configs, Model, run_epoch, plot_loss_curves, plot_forecasts,
-    plot_multiscale_predictions, ETTh1Dataset as _WindowDataset,
-    load_etth1,
+    plot_multiscale_predictions, plot_scale_predictions,
+    ETTh1Dataset as _WindowDataset, load_etth1,
 )
 from baseline_dlinear import DLinear
 
@@ -28,7 +18,7 @@ np.random.seed(2000)
 
 def load_ratio_split_dataset(path: str, seq_len: int, pred_len: int,
                               train_ratio: float = 0.7, test_ratio: float = 0.2):
-    
+
     df = pd.read_csv(path)
     date_col = df.columns[0]
     cols = [c for c in df.columns if c != date_col]
@@ -143,6 +133,10 @@ def train_timemixer(dataset, pred_len, csv_path, seq_len=96,
     plot_multiscale_predictions(model, test_ds, mean, std, device, col_names=cols,
                                  var_name=var_name, num_scales=M,
                                  save_path=f"multiscale_{tag}.png")
+    # Figure 4 reproduction: multiscale mixing (final) vs. each individual
+    # scale's predictor output, before summing.
+    plot_scale_predictions(model, test_ds, mean, std, device, col_names=cols,
+                            var_name=var_name, save_path=f"scalepred_{tag}.png")
 
     return test_loss, test_mae
 
@@ -240,6 +234,11 @@ if __name__ == "__main__":
             print(f"\n===== {name} on {args.dataset} — Summary =====")
             for pl, (mse, mae) in results.items():
                 print(f"pred_len={pl:>4}  MSE={mse:.4f}  MAE={mae:.4f}")
+            print(f"Average  MSE={sum(mses)/len(mses):.4f}  MAE={sum(maes)/len(maes):.4f}")
+
+    summarize("TimeMixer", tm_results)
+    summarize("DLinear", dl_results)
+
             print(f"Average  MSE={sum(mses)/len(mses):.4f}  MAE={sum(maes)/len(maes):.4f}")
 
     summarize("TimeMixer", tm_results)
