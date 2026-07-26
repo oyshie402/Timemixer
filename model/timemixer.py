@@ -1,8 +1,14 @@
-
-
-
+import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
+from torch.utils.data import Dataset
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+torch.manual_seed(2000)
+np.random.seed(2000)
 
 
 # ========================================================================
@@ -85,14 +91,37 @@ class MultiscaleDownsampling(nn.Module):
 
 
 class Embed(nn.Module):
-    """Sec 3.1: X0 = Embed(X)."""
+    """
+    Sec 3.1: X0 = Embed(X).
+
+    Matches the official repo's TokenEmbedding (used inside
+    DataEmbedding_wo_pos): a 1D convolution with kernel_size=3 and
+    circular padding, instead of a plain per-timestep nn.Linear. This
+    lets each embedded timestep borrow local context from its immediate
+    neighbors, which matters most at coarse scales where very few
+    timesteps are available (e.g. scale 3 with seq_len=96, M=3 sees only
+    12 points) — a plain per-timestep linear has no way to use
+    neighboring information there, which was found to make coarse-scale
+    predictors collapse to a near-constant output.
+    """
     def __init__(self, c_in: int, d_model: int, dropout: float = 0.1):
         super().__init__()
-        self.proj = nn.Linear(c_in, d_model, bias=False)
+        padding = 1  # kernel_size=3, padding=1 preserves sequence length
+        self.token_conv = nn.Conv1d(
+            in_channels=c_in, out_channels=d_model, kernel_size=3,
+            padding=padding, padding_mode='circular', bias=False
+        )
+        for m in self.modules():
+            if isinstance(m, nn.Conv1d):
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='leaky_relu')
         self.dropout = nn.Dropout(dropout)
 
     def forward(self, scales: list):
-        return [self.dropout(self.proj(x_m)) for x_m in scales]
+        # x_m: [B, len_m, c_in] -> conv expects [B, c_in, len_m] -> back to [B, len_m, d_model]
+        return [
+            self.dropout(self.token_conv(x_m.permute(0, 2, 1)).transpose(1, 2))
+            for x_m in scales
+        ]
 
 
 class SeriesDecomp(nn.Module):
@@ -220,9 +249,12 @@ class FutureMultipredictorMixing(nn.Module):
             for length in scale_lengths
         ])
 
-    def forward(self, x_list: list):
+    def forward(self, x_list: list, return_per_scale: bool = False):
         preds = [predictor(x_m) for predictor, x_m in zip(self.predictors, x_list)]
-        return torch.stack(preds, dim=0).sum(dim=0)
+        summed = torch.stack(preds, dim=0).sum(dim=0)
+        if return_per_scale:
+            return summed, preds  # preds: list of x_hat_m (Eq. 6, before summing)
+        return summed
 
 
 class WeightedFutureMultipredictorMixing(nn.Module):
@@ -236,13 +268,15 @@ class WeightedFutureMultipredictorMixing(nn.Module):
         ])
         self.scale_weights = nn.Parameter(torch.ones(len(scale_lengths)))
 
-    def forward(self, x_list: list):
-        preds = torch.stack(
-            [predictor(x_m) for predictor, x_m in zip(self.predictors, x_list)],
-            dim=0
-        )
+    def forward(self, x_list: list, return_per_scale: bool = False):
+        raw_preds = [predictor(x_m) for predictor, x_m in zip(self.predictors, x_list)]
+        preds = torch.stack(raw_preds, dim=0)
         weights = torch.softmax(self.scale_weights, dim=0).view(-1, 1, 1, 1)
-        return (preds * weights).sum(dim=0)
+        summed = (preds * weights).sum(dim=0)
+        if return_per_scale:
+            weighted_preds = [(preds[i] * weights[i]) for i in range(len(raw_preds))]
+            return summed, weighted_preds
+        return summed
 
 
 # ========================================================================
@@ -287,7 +321,7 @@ class Model(nn.Module):
             for _ in range(configs.down_sampling_layers + 1)
         ])
 
-    def forecast(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None):
+    def forecast(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, return_per_scale=False):
         B, T, N = x_enc.shape
 
         X = self.downsample(x_enc)
@@ -303,13 +337,24 @@ class Model(nn.Module):
         for block in self.pdm_blocks:
             XL = block(XL)
 
-        dec_out = self.fmm(XL)  # [B*N, pred_len, 1] if channel-independent, else [B, pred_len, C]
+        if not return_per_scale:
+            dec_out = self.fmm(XL)  # [B*N, pred_len, 1] if channel-independent, else [B, pred_len, C]
+            if self.channel_independence:
+                dec_out = dec_out.reshape(B, N, self.pred_len, 1).squeeze(-1).permute(0, 2, 1)  # [B, pred_len, N]
+            dec_out = self.normalize_layers[0](dec_out, 'denorm')
+            return dec_out
 
-        if self.channel_independence:
-            dec_out = dec_out.reshape(B, N, self.pred_len, 1).squeeze(-1).permute(0, 2, 1)  # [B, pred_len, N]
+        # per-scale mode — reproduces paper Figure 4 (x_hat_m in Eq. 6, before summing)
+        dec_out, per_scale_preds = self.fmm(XL, return_per_scale=True)
 
-        dec_out = self.normalize_layers[0](dec_out, 'denorm')
-        return dec_out
+        def _reshape_and_denorm(t):
+            if self.channel_independence:
+                t = t.reshape(B, N, self.pred_len, 1).squeeze(-1).permute(0, 2, 1)  # [B, pred_len, N]
+            return self.normalize_layers[0](t, 'denorm')
+
+        dec_out = _reshape_and_denorm(dec_out)
+        per_scale_preds = [_reshape_and_denorm(p) for p in per_scale_preds]
+        return dec_out, per_scale_preds
 
     def forward(self, x_enc, x_mark_enc=None, x_dec=None, x_mark_dec=None, mask=None):
         if self.task_name in ('long_term_forecast', 'short_term_forecast'):
@@ -319,11 +364,219 @@ class Model(nn.Module):
         )
 
 
-if __name__ == "__main__":
-    # Minimal smoke test: build the model and run a forward pass on random data.
-    configs = Configs(seq_len=96, pred_len=96, enc_in=7)
-    model = Model(configs)
-    x = torch.randn(4, configs.seq_len, configs.enc_in)
-    y = model(x)
-    print(f"input shape:  {tuple(x.shape)}")
-    print(f"output shape: {tuple(y.shape)}")
+# ========================================================================
+# DATA
+# ========================================================================
+class ETTh1Dataset(Dataset):
+    """Generic sliding-window dataset. Named for its original use with
+    ETTh1, but used as the shared window Dataset for all datasets in
+    run_multi_dataset.py too."""
+    def __init__(self, data: np.ndarray, seq_len: int, pred_len: int):
+        self.data = data
+        self.seq_len = seq_len
+        self.pred_len = pred_len
+
+    def __len__(self):
+        return len(self.data) - self.seq_len - self.pred_len + 1
+
+    def __getitem__(self, idx):
+        x = self.data[idx: idx + self.seq_len]
+        y = self.data[idx + self.seq_len: idx + self.seq_len + self.pred_len]
+        return torch.from_numpy(x).float(), torch.from_numpy(y).float()
+
+
+def load_etth1(path: str, seq_len: int, pred_len: int):
+    """ETT-specific loader: fixed 12/4/4-month train/val/test split, as
+    used across the Informer/Autoformer/TimeMixer line of papers."""
+    df = pd.read_csv(path)
+    cols = [c for c in df.columns if c != "date"]
+    data = df[cols].values.astype(np.float32)
+    n = len(data)
+    train_end = 12 * 30 * 24
+    val_end = train_end + 4 * 30 * 24
+    test_end = min(val_end + 4 * 30 * 24, n)
+    train_raw = data[:train_end]
+    val_raw = data[train_end - seq_len: val_end]
+    test_raw = data[val_end - seq_len: test_end]
+    mean, std = train_raw.mean(axis=0), train_raw.std(axis=0)
+    std[std == 0] = 1.0
+    norm = lambda x: (x - mean) / std
+    train_ds = ETTh1Dataset(norm(train_raw), seq_len, pred_len)
+    val_ds = ETTh1Dataset(norm(val_raw), seq_len, pred_len)
+    test_ds = ETTh1Dataset(norm(test_raw), seq_len, pred_len)
+    assert len(train_ds) > 0 and len(val_ds) > 0 and len(test_ds) > 0, \
+        "empty split — check seq_len/pred_len vs data length"
+    return train_ds, val_ds, test_ds, (mean, std), len(cols), cols
+
+
+# ========================================================================
+# TRAIN / EVAL HELPERS (shared by run_multi_dataset.py and baseline_dlinear.py)
+# ========================================================================
+def run_epoch(model, loader, criterion, optimizer=None, device="cpu"):
+    is_train = optimizer is not None
+    model.train() if is_train else model.eval()
+    total_loss, total_mae, n_batches = 0.0, 0.0, 0
+    with torch.set_grad_enabled(is_train):
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x)
+            loss = criterion(pred, y)
+            if is_train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+            total_loss += loss.item()
+            total_mae += torch.mean(torch.abs(pred - y)).item()
+            n_batches += 1
+    return total_loss / n_batches, total_mae / n_batches
+
+
+def plot_loss_curves(train_losses, val_losses, save_path="loss_curves.png"):
+    epochs = range(1, len(train_losses) + 1)
+    plt.figure(figsize=(7, 4.5))
+    plt.plot(epochs, train_losses, label="train MSE")
+    plt.plot(epochs, val_losses, label="val MSE")
+    best_ep = int(np.argmin(val_losses)) + 1
+    plt.axvline(best_ep, color="gray", linestyle="--", alpha=0.6, label=f"best val (epoch {best_ep})")
+    plt.xlabel("epoch"); plt.ylabel("MSE"); plt.title("Training / validation loss")
+    plt.legend(); plt.tight_layout()
+    plt.savefig(save_path, dpi=150); plt.close()
+    print(f"saved {save_path}")
+
+
+@torch.no_grad()
+def plot_forecasts(model, test_ds, mean, std, device, col_names,
+                    var_name="OT", n_samples=3, save_path="forecasts.png"):
+    model.eval()
+    var_idx = col_names.index(var_name)
+    v_mean, v_std = mean[var_idx], std[var_idx]
+    idxs = np.linspace(0, len(test_ds) - 1, n_samples, dtype=int)
+    fig, axes = plt.subplots(n_samples, 1, figsize=(8, 3 * n_samples), sharex=True)
+    if n_samples == 1:
+        axes = [axes]
+    for ax, i in zip(axes, idxs):
+        x, y = test_ds[i]
+        pred = model(x.unsqueeze(0).to(device)).cpu().squeeze(0)
+        y_true = y[:, var_idx].numpy() * v_std + v_mean
+        y_pred = pred[:, var_idx].numpy() * v_std + v_mean
+        x_hist = x[:, var_idx].numpy() * v_std + v_mean
+        hist_t = np.arange(-len(x_hist), 0)
+        fut_t = np.arange(0, len(y_true))
+        ax.plot(hist_t, x_hist, color="gray", label="history")
+        ax.plot(fut_t, y_true, color="black", label="ground truth")
+        ax.plot(fut_t, y_pred, color="tab:red", linestyle="--", label="forecast")
+        ax.axvline(0, color="gray", linewidth=0.8)
+        ax.set_title(f"test window {i}"); ax.legend(fontsize=8)
+    axes[-1].set_xlabel("time step (0 = forecast start)")
+    fig.suptitle(f"TimeMixer forecast vs. ground truth — variate '{var_name}'")
+    plt.tight_layout(); plt.savefig(save_path, dpi=150); plt.close()
+    print(f"saved {save_path}")
+
+
+@torch.no_grad()
+def get_multiscale_series(series_1d: np.ndarray, num_scales: int, decomp_kernel: int = 25):
+    x = torch.from_numpy(series_1d).float().view(1, -1, 1)
+    decomp = SeriesDecomp(decomp_kernel)
+    mixing_list, season_list, trend_list = [], [], []
+    cur = x
+    for m in range(num_scales + 1):
+        s, t = decomp(cur)
+        mixing_list.append(cur.squeeze().numpy())
+        season_list.append(s.squeeze().numpy())
+        trend_list.append(t.squeeze().numpy())
+        if m < num_scales:
+            cur = torch.nn.functional.avg_pool1d(
+                cur.permute(0, 2, 1), kernel_size=2, stride=2
+            ).permute(0, 2, 1)
+    return mixing_list, season_list, trend_list
+
+
+@torch.no_grad()
+def plot_multiscale_predictions(model, test_ds, mean, std, device, col_names,
+                                 var_name="OT", sample_idx=0, num_scales=3,
+                                 decomp_kernel=25, save_path="multiscale_predictions.png"):
+    model.eval()
+    var_idx = col_names.index(var_name)
+    v_mean, v_std = mean[var_idx], std[var_idx]
+
+    x, y = test_ds[sample_idx]
+    pred = model(x.unsqueeze(0).to(device)).cpu().squeeze(0)
+
+    x_hist = x[:, var_idx].numpy() * v_std + v_mean
+    y_true = y[:, var_idx].numpy() * v_std + v_mean
+    y_pred = pred[:, var_idx].numpy() * v_std + v_mean
+
+    full_true = np.concatenate([x_hist, y_true])
+    full_pred = np.concatenate([x_hist, y_pred])
+
+    mix_t, season_t, trend_t = get_multiscale_series(full_true, num_scales, decomp_kernel)
+    mix_p, season_p, trend_p = get_multiscale_series(full_pred, num_scales, decomp_kernel)
+
+    scale_ids = [0, num_scales]
+    row_labels = ["Mixing", "Season", "Trend"]
+    row_data_t = [mix_t, season_t, trend_t]
+    row_data_p = [mix_p, season_p, trend_p]
+
+    fig, axes = plt.subplots(3, len(scale_ids), figsize=(6 * len(scale_ids), 9))
+    for r in range(3):
+        for c, scale in enumerate(scale_ids):
+            ax = axes[r, c]
+            ax.plot(row_data_t[r][scale], label="GroundTruth", color="tab:blue")
+            ax.plot(row_data_p[r][scale], label="Prediction", color="tab:orange")
+            if r == 0:
+                ax.set_title(f"Scale{scale}")
+            if c == 0:
+                ax.set_ylabel(row_labels[r])
+            ax.legend(fontsize=7)
+
+    fig.suptitle(f"(c) Multiscale Season-trend Predictions\n"
+                 f"(input-{len(x_hist)}-predict-{len(y_true)})")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"saved {save_path}")
+
+
+@torch.no_grad()
+def plot_scale_predictions(model, test_ds, mean, std, device, col_names,
+                            var_name="OT", sample_idx=0, save_path="scale_predictions.png"):
+    """
+    Reproduces paper Figure 4: ground truth vs. prediction for (a) the
+    final ensembled ("Multiscale mixing") output and (b)-(e) each
+    individual scale's predictor output (x_hat_m in Eq. 6, before
+    summing), plotted side by side over the prediction horizon only.
+    """
+    model.eval()
+    var_idx = col_names.index(var_name)
+    v_mean, v_std = mean[var_idx], std[var_idx]
+
+    x, y = test_ds[sample_idx]
+    x_batch = x.unsqueeze(0).to(device)
+
+    dec_out, per_scale_preds = model.forecast(x_batch, return_per_scale=True)
+    dec_out = dec_out.cpu().squeeze(0)
+    per_scale_preds = [p.cpu().squeeze(0) for p in per_scale_preds]
+
+    y_true = y[:, var_idx].numpy() * v_std + v_mean
+    y_mixing = dec_out[:, var_idx].numpy() * v_std + v_mean
+    y_scales = [p[:, var_idx].numpy() * v_std + v_mean for p in per_scale_preds]
+
+    num_scales = len(y_scales)
+    titles = ["(a) Multiscale mixing"] + [f"({chr(ord('b') + m)}) Scale {m}" for m in range(num_scales)]
+    curves = [y_mixing] + y_scales
+
+    fig, axes = plt.subplots(1, len(curves), figsize=(4 * len(curves), 3.2), sharey=True)
+    for ax, title, curve in zip(axes, titles, curves):
+        ax.plot(y_true, label="GroundTruth", color="tab:blue")
+        ax.plot(curve, label="Prediction", color="tab:orange")
+        ax.set_title(title, fontsize=10)
+        ax.set_xlabel("time step")
+    axes[0].set_ylabel(f"predict-{len(y_true)}")
+    axes[0].legend(fontsize=7, loc="upper right")
+
+    fig.suptitle(f"Predictions from different scales — variate '{var_name}' "
+                 f"(input-{len(x)}-predict-{len(y_true)})")
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150)
+    plt.close()
+    print(f"saved {save_path}")
